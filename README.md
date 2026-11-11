@@ -2,7 +2,7 @@
 
 A small Discord client toolkit made with TypeScript and Bun.
 
-It handles connections and requests, so you can build the features your app needs.
+It handles connections and requests, so you can build the features your selfbot needs.
 
 Profile helpers are available from `prism/profile` for client builds, fingerprints, and request headers.
 
