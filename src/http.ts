@@ -1,4 +1,3 @@
-export type Fetcher = typeof fetch;
+export type Fetch = typeof fetch;
 
-export const defaultFetcher: Fetcher = (input, init) =>
-  globalThis.fetch(input, init);
+export const fetcher: Fetch = (input, init) => globalThis.fetch(input, init);

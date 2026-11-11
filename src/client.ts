@@ -1,42 +1,31 @@
-import {
-  Transport,
-  type RequestOptions,
-  type Result,
-} from "./transport.ts";
-import type { ClientModule } from "./modules.ts";
-import type { Fetcher } from "./http.ts";
+import type { Request, Result } from "./transport.ts";
+import { Transport } from "./transport.ts";
+import type { Module } from "./modules.ts";
+import type { Options } from "./types.ts";
 
-export interface ClientOptions {
-  authorization: string;
-  baseUrl?: string;
-  identityPath?: string;
-  timeout?: number;
-  retries?: number;
-  fetcher?: Fetcher;
-}
+export type State = "idle" | "connected" | "closed";
 
-export type ClientState = "idle" | "connected" | "closed";
-
-interface ModuleEntry {
-  module: ClientModule;
+interface Entry {
+  module: Module;
   ready: Promise<void>;
   disposing?: Promise<void>;
 }
 
 export class Client {
-  readonly #api: Transport;
-  readonly #identityPath: string;
-  readonly #modules = new Map<string, ModuleEntry>();
-  #state: ClientState = "idle";
+  readonly #transport: Transport;
+  readonly #path: string;
+  readonly #modules = new Map<string, Entry>();
+  #state: State = "idle";
   #identity: unknown;
   #connecting: Promise<unknown> | null = null;
+  #stopping: Promise<void> | null = null;
 
-  constructor(options: ClientOptions) {
-    this.#api = new Transport(options);
-    this.#identityPath = options.identityPath ?? "/users/@me";
+  constructor(options: Options) {
+    this.#transport = new Transport(options);
+    this.#path = options.path ?? "/users/@me";
   }
 
-  get state(): ClientState {
+  get state(): State {
     return this.#state;
   }
 
@@ -49,12 +38,12 @@ export class Client {
   }
 
   async connect<T = Record<string, unknown>>(): Promise<T> {
-    this.#assertOpen();
+    this.#open();
     if (this.connected) return this.#identity as T;
     if (this.#connecting) return this.#connecting as Promise<T>;
 
-    const pending = this.request<T>(this.#identityPath).then(({ data }) => {
-      this.#assertOpen();
+    const pending = this.request<T>(this.#path).then(({ data }) => {
+      this.#open();
       this.#identity = data;
       this.#state = "connected";
       return data;
@@ -67,24 +56,22 @@ export class Client {
     }
   }
 
-  request<T>(path: string, options?: RequestOptions): Promise<Result<T>> {
-    this.#assertOpen();
-    return this.#api.request(path, options);
+  request<T>(path: string, options?: Request): Promise<Result<T>> {
+    this.#open();
+    return this.#transport.request(path, options);
   }
 
-  async use<T extends ClientModule>(module: T): Promise<T> {
-    this.#assertOpen();
+  async use<T extends Module>(module: T): Promise<T> {
+    this.#open();
     const name = module.name.trim();
     if (!name) throw new Error("A module needs a name.");
     if (this.#modules.has(name)) throw new Error(`Module already added: ${name}`);
 
-    const entry: ModuleEntry = { module, ready: Promise.resolve() };
+    const entry: Entry = { module, ready: Promise.resolve() };
     this.#modules.set(name, entry);
     entry.ready = Promise.resolve()
       .then(() => module.setup?.(this))
-      .then(() => {
-        this.#assertOpen();
-      })
+      .then(() => this.#open())
       .catch(async (error: unknown) => {
         if (this.#modules.get(name) === entry) this.#modules.delete(name);
         await this.#dispose(entry);
@@ -94,7 +81,7 @@ export class Client {
     return module;
   }
 
-  module<T extends ClientModule = ClientModule>(name: string): T | undefined {
+  module<T extends Module = Module>(name: string): T | undefined {
     return this.#modules.get(name)?.module as T | undefined;
   }
 
@@ -108,30 +95,31 @@ export class Client {
   }
 
   async disconnect(): Promise<void> {
+    if (this.#stopping) return this.#stopping;
     if (this.#state === "closed") return;
     this.#state = "closed";
     this.#identity = undefined;
-    this.#api.close();
+    this.#transport.close();
 
     const entries = [...this.#modules.values()];
     this.#modules.clear();
-    await Promise.allSettled(
+    this.#stopping = Promise.allSettled(
       entries.map(async (entry) => {
         await entry.ready.catch(() => undefined);
         await this.#dispose(entry);
       }),
-    );
+    ).then(() => undefined);
+    await this.#stopping;
   }
 
-  #dispose(entry: ModuleEntry): Promise<void> {
+  #dispose(entry: Entry): Promise<void> {
     entry.disposing ??= Promise.resolve()
       .then(() => entry.module.dispose?.())
       .then(() => undefined);
     return entry.disposing;
   }
 
-  #assertOpen(): void {
+  #open(): void {
     if (this.#state === "closed") throw new Error("Client is disconnected.");
   }
 }
-

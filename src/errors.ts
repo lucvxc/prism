@@ -1,30 +1,35 @@
-import type { ApiErrorBody } from "./types.ts";
+import type { Payload } from "./types.ts";
 
-export class ApiError extends Error {
+export class Api extends Error {
   constructor(
     message: string,
     readonly status: number,
     readonly code: number | null,
-    readonly body: ApiErrorBody | null,
+    readonly body: Payload | null,
   ) {
     super(message);
-    this.name = "ApiError";
+    this.name = "Api";
   }
 }
 
-export class RateLimitError extends ApiError {
+export class Throttle extends Api {
   constructor(
-    readonly retryAfter: number,
-    body: ApiErrorBody | null,
+    readonly retry: number,
+    body: Payload | null,
   ) {
-    super(`API rate limit reached; retry after ${retryAfter} ms.`, 429, body?.code ?? null, body);
-    this.name = "RateLimitError";
+    super(
+      `Rate limit reached; retry after ${retry} ms.`,
+      429,
+      body?.code ?? null,
+      body,
+    );
+    this.name = "Throttle";
   }
 }
 
-export class NetworkError extends Error {
+export class Network extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
-    this.name = "NetworkError";
+    this.name = "Network";
   }
 }

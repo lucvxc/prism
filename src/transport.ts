@@ -1,13 +1,13 @@
-import { ApiError, NetworkError, RateLimitError } from "./errors.ts";
-import { defaultFetcher, type Fetcher } from "./http.ts";
-import type { ApiErrorBody } from "./types.ts";
+import { Api, Network, Throttle } from "./errors.ts";
+import { fetcher, type Fetch } from "./http.ts";
+import type { Options, Payload } from "./types.ts";
 
-type QueryValue = string | number | boolean | null | undefined;
+type Value = string | number | boolean | null | undefined;
 type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
-export interface RequestOptions {
+export interface Request {
   method?: Method;
-  query?: Readonly<Record<string, QueryValue>>;
+  query?: Readonly<Record<string, Value>>;
   body?: unknown;
   headers?: HeadersInit;
   signal?: AbortSignal;
@@ -22,15 +22,7 @@ export interface Result<T> {
   headers: Headers;
 }
 
-export interface TransportOptions {
-  authorization: string;
-  baseUrl?: string;
-  retries?: number;
-  timeout?: number;
-  fetcher?: Fetcher;
-}
-
-export const apiUrl = "https://discord.com/api/v10";
+export const endpoint = "https://discord.com/api/v10";
 
 function parse(text: string): unknown {
   if (!text) return null;
@@ -41,21 +33,20 @@ function parse(text: string): unknown {
   }
 }
 
-function errorBody(value: unknown): ApiErrorBody | null {
+function body(value: unknown): Payload | null {
   return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as ApiErrorBody)
+    ? (value as Payload)
     : null;
 }
 
-function retryDelay(response: Response, body: ApiErrorBody | null): number {
+function delay(response: Response, data: Payload | null): number {
   const header = response.headers.get("retry-after");
-  const fromHeader = header === null ? NaN : Number(header);
-  const rawBody = body?.retry_after;
-  const fromBody = typeof rawBody === "string" ? Number(rawBody) : rawBody;
-  if (Number.isFinite(fromHeader) && fromHeader >= 0)
-    return Math.ceil(fromHeader * 1_000);
-  if (typeof fromBody === "number" && Number.isFinite(fromBody) && fromBody >= 0)
-    return Math.ceil(fromBody * 1_000);
+  const head = header === null ? NaN : Number(header);
+  const raw = data?.retry_after;
+  const back = typeof raw === "string" ? Number(raw) : raw;
+  if (Number.isFinite(head) && head >= 0) return Math.ceil(head * 1_000);
+  if (typeof back === "number" && Number.isFinite(back) && back >= 0)
+    return Math.ceil(back * 1_000);
   if (header) {
     const date = Date.parse(header);
     if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
@@ -66,146 +57,167 @@ function retryDelay(response: Response, body: ApiErrorBody | null): number {
 function wait(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal.aborted) return reject(signal.reason);
-    const finish = () => {
-      signal.removeEventListener("abort", abort);
+    const done = () => {
+      signal.removeEventListener("abort", stop);
       resolve();
     };
-    const abort = () => {
+    const stop = () => {
       clearTimeout(timer);
-      signal.removeEventListener("abort", abort);
+      signal.removeEventListener("abort", stop);
       reject(signal.reason);
     };
-    const timer = setTimeout(finish, Math.min(ms, 2_147_000_000));
-    signal.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(done, Math.min(ms, 2_147_000_000));
+    signal.addEventListener("abort", stop, { once: true });
   });
 }
 
-function normalizeBase(value: string): URL {
-  const url = new URL(value);
+function base(value: string): URL {
+  const root = new URL(value);
   if (
-    !["http:", "https:"].includes(url.protocol) ||
-    url.username ||
-    url.password ||
-    url.search ||
-    url.hash
+    !["http:", "https:"].includes(root.protocol) ||
+    root.username ||
+    root.password ||
+    root.search ||
+    root.hash
   ) {
-    throw new Error("The API base URL must be an HTTP(S) URL without credentials or query.");
+    throw new Error("Base must be an HTTP(S) URL without credentials or query.");
   }
-  url.pathname = url.pathname.replace(/\/+$/, "");
-  return url;
+  root.pathname = root.pathname.replace(/\/+$/, "");
+  return root;
 }
 
 export class Transport {
   readonly #base: URL;
   readonly #timeout: number;
   readonly #retries: number;
-  readonly #fetcher: Fetcher;
+  readonly #fetch: Fetch;
   readonly #abort = new AbortController();
-  #authorization: string;
+  #auth: string;
   #closed = false;
 
-  constructor(options: TransportOptions) {
-    this.#authorization = options.authorization.trim();
-    if (!this.#authorization) throw new Error("An authorization value is required.");
-    this.#base = normalizeBase(options.baseUrl ?? apiUrl);
+  constructor(
+    options: Pick<
+      Options,
+      "authorization" | "base" | "timeout" | "retries" | "fetch"
+    >,
+  ) {
+    this.#auth = options.authorization.trim();
+    if (!this.#auth) throw new Error("Authorization is required.");
+    this.#base = base(options.base ?? endpoint);
     this.#retries = Math.min(5, Math.max(0, Math.round(options.retries ?? 3)));
     this.#timeout = Math.max(1_000, options.timeout ?? 15_000);
-    this.#fetcher = options.fetcher ?? defaultFetcher;
+    this.#fetch = options.fetch ?? fetcher;
   }
 
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    this.#authorization = "";
+    this.#auth = "";
     this.#abort.abort(new Error("Client disconnected."));
   }
 
-  async request<T>(path: string, options: RequestOptions = {}): Promise<Result<T>> {
+  async request<T>(path: string, options: Request = {}): Promise<Result<T>> {
     if (this.#closed) throw new Error("Client is disconnected.");
-    if (options.body instanceof FormData)
+    if (typeof FormData !== "undefined" && options.body instanceof FormData)
       throw new Error("Form uploads are outside the core client API.");
 
-    const url = this.#url(path);
+    const target = this.#route(path);
     for (const [key, value] of Object.entries(options.query ?? {})) {
-      if (value !== null && value !== undefined) url.searchParams.set(key, String(value));
+      if (value !== null && value !== undefined)
+        target.searchParams.set(key, String(value));
     }
 
     const method = options.method ?? "GET";
-    const canRetry = method === "GET" && options.retry !== "none";
-    const parentSignal = options.signal
+    const retry = method === "GET" && options.retry !== "none";
+    const outer = options.signal
       ? AbortSignal.any([options.signal, this.#abort.signal])
       : this.#abort.signal;
 
     for (let attempt = 0; ; attempt++) {
       const signal = AbortSignal.any([
-        parentSignal,
+        outer,
         AbortSignal.timeout(options.timeout ?? this.#timeout),
       ]);
       const headers = new Headers(options.headers);
-      if (!headers.has("Authorization"))
-        headers.set("Authorization", this.#authorization);
+      if (!headers.has("Authorization")) headers.set("Authorization", this.#auth);
       if (!headers.has("Accept")) headers.set("Accept", "application/json");
       if (options.body !== undefined && !headers.has("Content-Type"))
         headers.set("Content-Type", "application/json");
 
       let response: Response;
       try {
-        response = await this.#fetcher(url, {
+        response = await this.#fetch(target, {
           method,
           headers,
-          ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+          ...(options.body !== undefined
+            ? { body: JSON.stringify(options.body) }
+            : {}),
           signal,
           redirect: "error",
         });
       } catch (cause) {
         if (this.#closed) throw new Error("Client is disconnected.", { cause });
         if (options.signal?.aborted) throw cause;
-        if (canRetry && attempt < this.#retries) {
-          await wait(Math.min(500 * 2 ** attempt, 4_000), parentSignal);
+        if (retry && attempt < this.#retries) {
+          await wait(Math.min(500 * 2 ** attempt, 4_000), outer);
           continue;
         }
-        throw new NetworkError("API request failed.", { cause });
+        throw new Network("API request failed.", { cause });
       }
 
       const text = await response.text();
       if (this.#closed) throw new Error("Client is disconnected.");
       const data = parse(text);
-      const body = errorBody(data);
+      const issue = body(data);
 
       if (response.status === 429) {
-        const delay = retryDelay(response, body);
-        if (canRetry && attempt < this.#retries) {
-          await wait(delay, parentSignal);
+        const retry = delay(response, issue);
+        if (
+          method === "GET" &&
+          options.retry !== "none" &&
+          attempt < this.#retries
+        ) {
+          await wait(retry, outer);
           continue;
         }
-        throw new RateLimitError(delay, body);
+        throw new Throttle(retry, issue);
       }
 
       if (response.ok) {
-        return { status: response.status, data: data as T, text, headers: response.headers };
+        return {
+          status: response.status,
+          data: data as T,
+          text,
+          headers: response.headers,
+        };
       }
-      throw new ApiError(
-        body?.message ?? `API returned ${response.status}.`,
+      throw new Api(
+        issue?.message ?? `API returned ${response.status}.`,
         response.status,
-        body?.code ?? null,
-        body,
+        issue?.code ?? null,
+        issue,
       );
     }
   }
 
-  #url(path: string): URL {
-    if (!path || path.startsWith("//") || path.includes("\\") || path.includes("#"))
-      throw new Error("Request paths must be relative to the configured API base URL.");
+  #route(path: string): URL {
+    if (
+      !path ||
+      path.startsWith("//") ||
+      path.includes("\\") ||
+      path.includes("#")
+    )
+      throw new Error("Path must be relative to the configured API base.");
 
     const route = path.startsWith("/") ? path : `/${path}`;
-    const basePath = this.#base.pathname;
-    const url = new URL(`${basePath}${route}`, this.#base.origin);
+    const root = this.#base.pathname;
+    const target = new URL(`${root}${route}`, this.#base.origin);
     if (
-      url.origin !== this.#base.origin ||
-      (basePath && url.pathname !== basePath && !url.pathname.startsWith(`${basePath}/`))
+      target.origin !== this.#base.origin ||
+      (root && target.pathname !== root && !target.pathname.startsWith(`${root}/`))
     ) {
-      throw new Error("Request path escaped the configured API base URL.");
+      throw new Error("Path escaped the configured API base.");
     }
-    return url;
+    return target;
   }
 }
