@@ -1,6 +1,6 @@
 # Prism
 
-A small Discord client toolkit made with TypeScript and Bun.
+A small Discord client made with TypeScript and Bun.
 
 It handles connections and requests, so you can build the features your selfbot needs.
 
